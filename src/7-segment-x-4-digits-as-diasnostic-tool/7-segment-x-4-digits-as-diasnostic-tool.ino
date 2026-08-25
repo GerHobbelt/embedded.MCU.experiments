@@ -31,6 +31,23 @@
 
 #include <ArduinoUniqueID.h>
 
+#include <errno.h>
+
+#include "diagnostic_helpers.h"
+
+
+
+// One way to size the stack: just drop some content in there and thus have the .stack segment grow!
+// We're using GCC-specific functionality to place this into the .stack section, not where it would normally go.
+// The linker script makes sure that the .stack section is at the right place.
+__attribute__ ((section(".stack"), used))
+static uint8_t StackSpace[9000];
+
+
+// define the function callback prototype here to twart the ArduinoIDE code preprocessor screwing up the parse order of the final sourcecode.
+typedef bool condition_check_t(uint32_t elapsed_ms, uint32_t delay_ms);
+
+
 /*
   Serial Call and Response
   Language: Wiring/Arduino
@@ -128,6 +145,7 @@ static void setup_port_C() {
 #endif
 
   volatile auto dummy = PIOC->PIO_ISR;  // dummy read to clear any interrupt glitches during setup
+  (void)dummy;
 
   //auto pinwpstat = PIOC->PIO_WPSR;
 
@@ -148,23 +166,46 @@ static void setup_port_C() {
 
 
 
-static void dumpUniqueID(void)
+static void dumpUniqueID()
 {
-	UniqueIDdump(Serial);
-	Serial.print("UniqueID: ");
-	for (size_t i = 0; i < UniqueIDsize; i++)
-	{
-		if (UniqueID[i] < 0x10)
-			Serial.print("0");
-		Serial.print(UniqueID[i], HEX);
-		Serial.print(" ");
-	}
-	Serial.println();
+  UniqueIDdump(Serial);
+  Serial.print("UniqueID: ");
+  for (size_t i = 0; i < UniqueIDsize; i++)
+  {
+    if (UniqueID[i] < 0x10)
+      Serial.print("0");
+    Serial.print(UniqueID[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
 }
+
+//typedef bool condition_check_t(uint32_t elapsed_ms, uint32_t delay_ms);
+
+static bool delay_unless(uint32_t delay_ms, condition_check_t *check)
+{
+    uint32_t current;
+    uint32_t elapsed;
+    bool rv = false;
+
+    const uint32_t start = GetTickCount();
+    do
+    {
+        current = GetTickCount();
+        elapsed = current - start;
+        rv = check(elapsed, delay_ms);
+    } while (!rv && elapsed < delay_ms);
+
+    return rv;
+}
+
+static volatile bool debug_print_available = false;
 
 // the setup function runs once when you press reset or power the board
 void setup() {
 	Serial.begin(250000);
+
+  debug_print_available = true;
 
   // initialize digital pin LED_BUILTIN as an output.
   pinMode(LED_BUILTIN, OUTPUT);
@@ -175,41 +216,99 @@ void setup() {
 
   setup_port_C();
 
+  detect_stack_size();
+  find_heap_limit_and_report_search();
+
   establishContact();  // send a byte to establish contact until receiver responds
 }
 
+static bool is_any_user_entry_data_available(uint32_t elapsed_ms = 0, uint32_t delay_ms = 0) {
+  (void)elapsed_ms;
+  (void)delay_ms;
+
+  return (Serial.available() > 0);
+}
+
+
+
+// the string that will grow ad infinitum, or rather: until the heap allocation BREAKS. 
+// We use this to test the heap allocation logic and slowly run the (growing) heap into the stack,
+// resulting in an application CRASH!
+String dummyStr;
+
+
+
 // the loop function runs over and over again forever
 void loop() {
-  dumpUniqueID();
+  static uint32_t time_of_last_user_action = 0;
+  // reset the 'interactivity is happening' flag/time to 'inactive' when 8 seconds have passed since the last user activity:
+  if (time_of_last_user_action && GetTickCount() > time_of_last_user_action + 8000) {
+    time_of_last_user_action = 0;
+  }
+
+  if (time_of_last_user_action == 0) {
+    dumpUniqueID();
+    
+    detect_stack_size();
+    find_heap_limit_and_report_search();
+
+    slowly_consume_heap_space();
+  }
+
+
+  {
+    void *tp = malloc(512);
+    Serial.printf("LOOP:TEST malloc: returned %p\n", tp);
+    if (!tp)
+      delay(5000);
+    free(tp);
+  }
   
-  detect_heap_size();
-  detect_stack_size();
 
   establishContact();  // send a byte to establish contact until receiver responds
   // if we get a valid byte, read analog ins:
   if (Serial.available() > 0) {
+    time_of_last_user_action = GetTickCount();
     // get incoming byte:
     auto input = Serial.readString();
 
     char hexbuf[60];
-    sprintf(hexbuf, "Recieved: (len:%u) %s", input.length(), input.c_str());
+    snprintf(hexbuf, sizeof(hexbuf), "Recieved: (len:%u) %s", input.length(), input.c_str());
+  	Serial.print(strlen(hexbuf));
+  	Serial.print("> ");
   	Serial.write(hexbuf);
   	Serial.println();
 
+  	Serial.write(input.c_str());
+  	Serial.println();
+
+    dummyStr += input;      // run towards a heap overflow...
+
     unsigned int v;
     sscanf(input.c_str(), "%X", &v);
-    sprintf(hexbuf, "Decoded: 0x%04X", v);
+    snprintf(hexbuf, sizeof(hexbuf), "Decoded: 0x%04X", v);
+  	Serial.print(strlen(hexbuf));
+  	Serial.print("> ");
   	Serial.write(hexbuf);
   	Serial.println();
+
+    dummyStr += hexbuf;      // run towards a heap overflow...
+
+    // unless the input is the CLR command:
+    if (input == "CLR\n") {
+      dummyStr.reset();
+      dummyStr = "";
+    	Serial.println("############# CLEAR DUUMY STRING ###############");
+    }
 
     PIO_Clear(PIOC, pinmask);
     PIO_Set(PIOC, pinmask & v);
   }
 
   digitalWrite(LED_BUILTIN, HIGH);  // change state of the LED by setting the pin to the HIGH voltage level
-  delay(1000);                      // wait for a second
+  delay_unless(50, is_any_user_entry_data_available);
   digitalWrite(LED_BUILTIN, LOW);   // change state of the LED by setting the pin to the LOW voltage level
-  delay(1000);                      // wait for a second
+  delay_unless(50, is_any_user_entry_data_available);
 }
 
 
@@ -277,250 +376,131 @@ static const uint8_t dots_font[] = {
   0x9C,   // DEFG
 };
 
-extern "C" {
-/* Initialize segments */
-extern uint32_t _sfixed;
-extern uint32_t _efixed;
-extern uint32_t _etext;
-extern uint32_t _srelocate;
-extern uint32_t _erelocate;
-extern uint32_t _szero;
-extern uint32_t _ezero;
-extern uint32_t _sstack;
-extern uint32_t _estack;
+const uint8_t *sbrk_heap_end = NULL;
 
-  extern const void *__malloc_sbrk_base;
-  extern const uint32_t __malloc_max_total_mem;
-  extern const uint32_t __malloc_max_sbrked_mem;
-  extern const void *__malloc_top_pad;
- 
-  extern const uint32_t _sbss;
-  extern const uint32_t _ebss;
+extern "C" 
+caddr_t _sbrk(int incr) {
 
-  extern const uint32_t _end;
+  if (!debug_print_available) {
+    const uint8_t *prev_heap_end;
 
-  // extern caddr_t _sbrk ( int incr );
+    if (sbrk_heap_end == NULL) {
+        sbrk_heap_end = (const uint8_t *)&_end;
+    }
+    prev_heap_end = sbrk_heap_end;
 
+    sbrk_heap_end += incr;
+
+    // protection
+    const uint8_t * const stack_start = (const uint8_t *)&_sstack;
+    if (sbrk_heap_end >= stack_start) {
+#if 0
+      __set_errno(ENOMEM);
+#else
+      errno = ENOMEM;
+#endif
+      return (caddr_t) -1;
+    }
+
+    return (caddr_t)prev_heap_end;
+  }
+
+  return custom_sbrk(incr);
 }
 
-String dummyStr;
+caddr_t custom_sbrk(int incr) {
+  const uint8_t *prev_heap_end;
+  const int orig_incr = incr;
 
-void detect_heap_size() {
-  caddr_t sbrk_heap_end = _sbrk(0);
+  if (incr) {
+    Serial.print("\n\nSBRK *start* : incr = ");
+    Serial.print(incr);
+    Serial.println(" bytes\n");
+  }
 
-  const uint8_t *heap_start = (const uint8_t *)&_end;
-  const uint8_t *heap_end = (const uint8_t *)sbrk_heap_end;
+  const uint8_t * const heap_start = (const uint8_t *)&_end;
 
-  unsigned int heap_size = heap_end - heap_start;
+  static volatile uint8_t init = 0;
+  if (!init) {
+    init = 2;
+  }
+  else {
+    //assert(init);
+    init = init + 1;  // 1->2 unless we're a nested call due to (hidden?) malloc in the debug code below...
 
-	Serial.print("malloc/free heap size: ");
-	Serial.print(heap_size);
-	Serial.print(" bytes\n");
+    if (init > 2) {
+      Serial.print("SBRK: ######## NESTED CALL: REJECT! #########\n");
+      incr = 0;
+    }
+  }
 
-  {
-    static int counter = 0;
+  prev_heap_end = sbrk_heap_end;
+
+  if (incr != 0) {
+    find_heap_limit_and_report_search();
+
+    sbrk_heap_end += incr;
+
+    // protect/limit growth: make sure we don't run the heap into the stack,
+    // while we also check/adjust the top by using the lowest known-used stack address:
+
+    Serial.printf("SBRK: current stack info:\n");
+
+    const uint8_t *current_stack_pos = (const uint8_t *)get_current_stack_bottom();
+
+    report_current_stack_usage();
+
+    // scan the 'empty zone' between heap_end and stack_start for any changes: that's how deep the stack has gone in actuality, i.e. including the active interrupt handlers, etc.!
+    const uint8_t *p = find_end_of_last_chunk_of_empty_space_marker_bytes(get_sbrk_marker_byte_ref(), prev_heap_end, current_stack_pos);
+    const uint8_t *top = adjust_top_address(sbrk_heap_end, p, 512);
+
+    // don't merge these into a single Serial.printf() call, as than we'll overflow internal buffers and the output will be clipped:
+    Serial.printf("SBRK: incr = %d", incr);
+    Serial.printf(", RAW calculated heap end = %p, previous heap end = %p", sbrk_heap_end, prev_heap_end);
+    Serial.printf(", top = %p\n", top);
+    sbrk_heap_end = top;
+    Serial.printf("SBRK: actual incr (after top clipping) = %d\n", int(sbrk_heap_end - prev_heap_end));
+
+    incr = int(sbrk_heap_end - prev_heap_end);
+    // we cannot REDUCE the heap, for that's asking for spurious trouble!
+    if (incr < 0) {
+      Serial.printf("SBRK: !!!! NEGATIVE incr !!! incr = %d", incr);
+      incr = 0;
+      sbrk_heap_end = prev_heap_end;
+    }
+
+    Serial.printf("SBRK: new heap size: %d\n", int(sbrk_heap_end - heap_start));
+
+    find_heap_limit_and_report_search();
+  }
+
+  init = init - 1; // 2->1 unless we're a nested call, in which case we go 3->2
+
+  if (incr == 0 && orig_incr > 0) {
+#if 0
+    __set_errno(ENOMEM);
+#else
+    errno = ENOMEM;
+#endif
+    return (caddr_t) -1;
+  }
+
+  return (caddr_t)prev_heap_end;
+}
+
+
+void slowly_consume_heap_space() {
+  Serial.printf("TEST malloc: %s\n", __func__);
+
+  static int counter = 0;
+  if (++counter > 10) {
+    // run towards a heap overflow...
     dummyStr += "\n........................................................................................................................................................................................................................................................heap size test #";
     char nstr[20];
-    dummyStr += itoa(++counter, nstr, 10);
+    dummyStr += itoa(counter, nstr, 10);
   }
 }
 
-static void *get_current_stack_bottom() {
-  // https://stackoverflow.com/questions/57032089/reading-stack-pointer-value-in-arm
-  // https://stackoverflow.com/questions/20059673/print-out-value-of-stack-pointer
-  // https://gcc.gnu.org/onlinedocs/gcc/Return-Address.html
-  // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=121013
-#if __has_builtin(__builtin_stack_address)
-  void *p = __builtin_stack_address();
-  return p;
-#else
-  void *p = __builtin_frame_address(0);
-  return p;
-#endif
-}
-
-static void *get_current_stack_bottom_alloca() {
-  // https://gcc.gnu.org/onlinedocs/gcc/Stack-Allocation.html
-  void *p = __builtin_alloca(4);
-#if 0  // GCC v15 warning: function returns address of local variable [-Wreturn-local-addr]; code generator fails at run-time, i.e. this function returns NULL!
-  return p;
-#else
-  return __builtin_frame_address(0);
-#endif
-}
-
-static void printZoneAddressHelper(const void *addr) {
-  unsigned long v = (unsigned long)addr;
-	Serial.print("0x");
-	Serial.print(v, 16);
-}
-
-static void printZoneAddressMarkerName(const char *name) {
-	Serial.print("* ");
-	Serial.print(name);
-  auto l = strlen(name);
-	Serial.print(" ");
-	Serial.print("................................................................." + l);
-	Serial.print(": ");
-}
-
-#define printZoneAddress(marker)                    \
-  printZoneAddressMarkerName(#marker);              \
-  printZoneAddressHelper((const void *)&marker);    \
-	Serial.print("\n")
-
-void detect_stack_size() {
-  caddr_t sbrk_heap_end = _sbrk(0);
-
-  const uint8_t *heap_end = (const uint8_t *)sbrk_heap_end;
-
-  const uint8_t *stack_start = (const uint8_t *)&_sstack;
-  const uint8_t *stack_end = (const uint8_t *)&_estack;
-
-  int stack_size = stack_end - stack_start;
-
-	Serial.print("application STACK size: ");
-	Serial.print(stack_size);
-	Serial.print(" bytes\n");
-
-	Serial.print("\nZone Addresses:\n");
-
-  printZoneAddress(_sfixed);
-  printZoneAddress(_efixed);
-  printZoneAddress(_etext);
-  printZoneAddress(_srelocate);
-  printZoneAddress(_erelocate);
-  printZoneAddress(_szero);
-  printZoneAddress(_ezero);
-  printZoneAddress(_sstack);
-  printZoneAddress(_estack);
-  printZoneAddress(_sbss);
-  printZoneAddress(_ebss);
-  printZoneAddress(_end);
-
-  printZoneAddressMarkerName("malloc/free heap end");              
-  printZoneAddressHelper((const void *)heap_end);    
-	Serial.print("\n");
-
-  void *current_estack = get_current_stack_bottom();
-  printZoneAddressMarkerName("current stack end");              
-  printZoneAddressHelper(current_estack);    
-	Serial.print("\n");
-
-  current_estack = get_current_stack_bottom_alloca();
-  printZoneAddressMarkerName("current stack end (v2: alloca based)");              
-  printZoneAddressHelper(current_estack);    
-	Serial.print("\n");
-
-  {
-    static bool init = false;
-    static uint8_t fill_byte;
-
-    if (!init) {
-      unsigned int histogram[256] = {0};
-      int count = 0;
-      unsigned short int low_idx;
-      unsigned int low_val;
-      const uint8_t *current_estack = (const uint8_t *)get_current_stack_bottom_alloca();
-
-      printZoneAddressMarkerName("current stack end (#3, also alloca based)");              
-      printZoneAddressHelper(current_estack);
-      Serial.print("\n");
-
-      for (const uint8_t *p = current_estack; p < (const uint8_t *)&_sstack; p++) {
-        histogram[*p]++;
-        count++;
-      }
-
-    	Serial.print("stack data histogram:\n  stack size/count = ");
-    	Serial.print(count);
-    	Serial.println();
-
-      low_idx = 0;
-      low_val = histogram[low_idx];
-      for (unsigned short int i = 1; i < 256; i++) {
-        Serial.print("[0x");
-      	Serial.print(i, 16);
-        Serial.print("] = ");
-      	Serial.print(histogram[i]);
-        
-        if (histogram[i] < low_val) {
-          low_idx = i;
-          low_val = histogram[i];
-
-          Serial.print(" (*)");
-        }
-
-        Serial.println();
-      }
-      fill_byte = low_idx;
-
-    	Serial.print("-------------------------\nlow @ 0x");
-     	Serial.print(fill_byte, 16);
-      Serial.println();
-    	Serial.print("-------------------------\nfilling empty RAM: length = ");
-     	Serial.print(current_estack - heap_end);
-      Serial.println();
-
-      memset((void *)heap_end, fill_byte, current_estack - heap_end);
-
-      init = true;
-    }
-    else {
-      //assert(init);
-      const uint8_t *current_estack = (const uint8_t *)get_current_stack_bottom_alloca();
-
-      printZoneAddressMarkerName("current stack end (#4, also alloca based)");              
-      printZoneAddressHelper(current_estack);
-      Serial.println();
-
-      // scan the 'empty zone' between heap end and stack start for any changes: that's how deep the stack has gone!
-      const uint8_t *p;
-      for (p = current_estack - 4; p > heap_end; p--) {
-        if (*p != fill_byte) {
-        	Serial.print("SCAN: fill_byte (0x");
-        	Serial.print(fill_byte, 16);
-        	Serial.print(") has been changed at index ");
-        	Serial.print(int(current_estack - p));
-        	Serial.print(", which is offset ");
-        	Serial.print(p - heap_end);
-        	Serial.print(" from heap_end.\n");
-        }
-      }
-    }
-  }
-
-  //extern const void *__malloc_sbrk_base;
-  printZoneAddressMarkerName("__malloc_sbrk_base");              
-  printZoneAddressHelper((const void *)&__malloc_sbrk_base);    
-  Serial.print(" (= ");              
-  printZoneAddressHelper(__malloc_sbrk_base);    
-	Serial.print(")\n");
-
-  //extern const uint32_t __malloc_max_total_mem;
-  printZoneAddressMarkerName("__malloc_max_total_mem");              
-  printZoneAddressHelper((const void *)&__malloc_max_total_mem);    
-  Serial.print(" (= ");              
-  Serial.print(__malloc_max_total_mem);    
-	Serial.print(")\n");
-
-  //extern const uint32_t __malloc_max_sbrked_mem;
-  printZoneAddressMarkerName("__malloc_max_sbrked_mem");              
-  printZoneAddressHelper((const void *)&__malloc_max_sbrked_mem);    
-  Serial.print(" (= ");              
-  Serial.print(__malloc_max_sbrked_mem);    
-	Serial.print(")\n");
-
-  //extern const void *__malloc_top_pad;
-  printZoneAddressMarkerName("__malloc_top_pad");              
-  printZoneAddressHelper((const void *)&__malloc_top_pad);    
-  Serial.print(" (= ");              
-  printZoneAddressHelper(__malloc_top_pad);    
-	Serial.print(")\n");
-
-	Serial.print("...");
-	Serial.println(dummyStr.c_str() + max(0, int(dummyStr.length()) - 40));
-}
 
 
 
