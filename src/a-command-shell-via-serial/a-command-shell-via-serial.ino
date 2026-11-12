@@ -256,12 +256,19 @@ void loop() {
 
   {
     void *tp = malloc(512);
-    Serial.printf("LOOP:TEST malloc: returned %p\n", tp);
+    Serial.printf("LOOP:TEST malloc: returned %p (dummyStr.length = %u)\n", tp, dummyStr.length());
     if (!tp)
       delay(5000);
     free(tp);
   }
-  
+  delay(1000);
+
+
+  if (dummyStr.length() > 4000) {
+    dummyStr.reset();
+    dummyStr = "";
+  }
+
 
   establishContact();  // send a byte to establish contact until receiver responds
   // if we get a valid byte, read analog ins:
